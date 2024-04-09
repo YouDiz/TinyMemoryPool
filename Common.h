@@ -54,29 +54,29 @@ static void*& objectNext(void* object) { return *(void**)object; }
 class FreeList {
 private:
     void* freeList = nullptr;  // 自由链表的起始指针
-    size_t maxSize = 1;        // 最大尺寸
+    size_t maxGetNum = 1;   // tc申请空间块的最大数量
     size_t size = 0;           // 链表大小
 
 public:
     // 弹出一定数量的节点，并返回节点范围的起始和结束指针
-    void popObjectRange(void*& start, void*& end, size_t n) {
-        assert(n <= size);
+    void popObjectRange(void*& start, void*& end, size_t objectNum) {
+        assert(objectNum <= size);
 
         start = end = freeList;
-        for (size_t i = 0; i < n - 1; ++i) {
+        for (size_t i = 0; i < objectNum - 1; ++i) {
             end = objectNext(end);
         }
 
         freeList = objectNext(end);
         objectNext(end) = nullptr;
-        size -= n;
+        size -= objectNum;
     }
 
     // 将一段节点范围推入链表
-    void pushObjectRange(void* start, void* end, size_t size) {
+    void pushObjectRange(void* start, void* end, size_t objectNum) {
         objectNext(end) = freeList;
         freeList = start;
-        size += size;
+        size += objectNum;
     }
 
     // 推入一个节点到链表
@@ -96,8 +96,8 @@ public:
         return object;
     }
 
-    // 返回链表最大尺寸
-    size_t& getMaxSize() { return maxSize; }
+    // 向cc申请内存的最大数目
+    size_t& maxFromCentral() { return maxGetNum; }
     // 返回链表大小
     size_t getSize() { return size; }
 
@@ -107,81 +107,73 @@ public:
 // Span结构体，用于管理内存页
 struct Span {
    public:
-    PageID _pageID = 0;
-    size_t _n = 0;
-    size_t _objSize = 0;
+    PageID pageID = 0;     // 页号
+    size_t pageSize = 0;   // 页面数
+    size_t objectSize = 0; // 
 
-    void* _freeList = nullptr;
-    size_t use_count = 0;
+    void* freeList = nullptr;
+    size_t useCount = 0;
 
-    Span* _prev = nullptr;
-    Span* _next = nullptr;
+    Span* prev = nullptr;
+    Span* next = nullptr;
 
-    bool _isUse = false;
+    bool isUse = false;
 };
 
 // Span链表类，用于管理Span对象
 class SpanList {
-   public:
+private:
+    Span* head;  // 链表头指针
+
+public:
+    std::mutex spanListmtx;  // 互斥锁，用于多线程同步
+
+public:
+
+    // 构造函数，初始化头指针
+    SpanList() : head(new Span) {
+        head->next = head;
+        head->prev = head;
+    }
+
     // 弹出链表首部的Span对象
-    Span* PopFront() {
-        Span* front = _head->_next;
-        Erase(front);
+    Span* popFront() {
+        Span* front = head->next;
+        erase(front);
         return front;
     }
 
-    // 判断链表是否为空
-    bool Empty() { return _head == _head->_next; }
-
-    // 将Span对象推入链表首部
-    void PushFront(Span* span) { Insert(Begin(), span); }
-
-    // 返回链表首部迭代器
-    Span* Begin() { return _head->_next; }
-
-    // 返回链表尾部迭代器
-    Span* End() { return _head; }
-
     // 从链表中删除指定的Span对象
-    void Erase(Span* pos) {
-        assert(pos);
-        assert(pos != _head);
+    void erase(Span* span) {
+        assert(span && span != head);
 
-        Span* prev = pos->_prev;
-        Span* next = pos->_next;
-
-        prev->_next = next;
-        next->_prev = prev;
+        span->prev->next = span->next;
+        span->next->prev = span->prev;
     }
 
     // 在指定位置插入Span对象
-    void Insert(Span* pos, Span* ptr) {
-        assert(pos);
-        assert(ptr);
+    void insert(Span* pos, Span* span) {
+        assert(pos && span);
 
-        Span* prev = pos->_prev;
-
-        prev->_next = ptr;
-        ptr->_prev = prev;
-
-        ptr->_next = pos;
-        pos->_prev = ptr;
+        span->prev = pos->prev;
+        span->next = pos;
+        pos->prev->next = span;
+        pos->prev = span;
     }
 
-    // 构造函数，初始化头指针
-    SpanList() {
-        _head = new Span;
-        _head->_next = _head;
-        _head->_prev = _head;
-    }
+    // 判断链表是否为空
+    bool empty() { return head == head->next; }
 
-   private:
-    Span* _head;  // 链表头指针
-   public:
-    std::mutex _mtx;  // 互斥锁，用于多线程同步
+    // 将Span对象推入链表首部
+    void pushFront(Span* span) { insert(begin(), span); }
+
+    // 返回链表首部迭代器
+    Span* begin() { return head->next; }
+
+    // 返回链表尾部迭代器
+    Span* end() { return head; }
+
 };
-
-#include <cassert>
 
 class SizeClass {
 private:
@@ -260,25 +252,20 @@ public:
     }
 
 public:
-    // 计算每次移动的内存块数量
-    static size_t calculateNumMoveSize(size_t size) {
+    // tc单次向cc申请的上限
+    static size_t maxAllocLimit(size_t size) {
         assert(size > 0);
 
         int num = MAX_BYTES / size;
-        if (num > 512) {
-            num = 512;
-        }
-
-        if (num < 2) {
-            num = 2;
-        }
+        if (num > 512) num = 512;
+        if (num < 2)   num = 2;
 
         return num;
     }
 
     // 计算内存页的移动数量
-    static size_t calculateNumMovePage(size_t size) {
-        size_t num = calculateNumMoveSize(size);
+    static size_t numMovePage(size_t size) {
+        size_t num = maxAllocLimit(size);
         size_t numPages = num * size;
 
         numPages >>= PAGE_SHIFT;
